@@ -23,7 +23,10 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta  # type: ignore[import]
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, SMAIndicator, MACD
+from ta.volatility import AverageTrueRange, BollingerBands
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +36,8 @@ logger = logging.getLogger(__name__)
 
 PCR_STRONG_BUY: float = 0.9
 PCR_WEAK_BUY: float = 1.1
-PCR_HOLD: float = 2.0
-PCR_STRONG_SELL: float = 3.5
+PCR_HOLD: float = 1.4   
+PCR_STRONG_SELL: float = 1.8
 
 RSI_BUY_THRESHOLD: float = 45.0
 RSI_SELL_THRESHOLD: float = 55.0
@@ -118,7 +121,7 @@ def compute_signals(
     # ------------------------------------------------------------------
     # RSI (computed on close prices using pandas-ta)
     # ------------------------------------------------------------------
-    rsi_series = ta.rsi(merged["close"], length=rsi_period)
+    rsi_series = RSIIndicator(close=merged["close"], window=rsi_period).rsi()
     merged["rsi"] = rsi_series
 
     # ------------------------------------------------------------------

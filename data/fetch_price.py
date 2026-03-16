@@ -68,7 +68,17 @@ def fetch_price_data(
 
     exchange = ccxt.binance({"enableRateLimit": True})
     try:
-        raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        #raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        since = exchange.parse8601('2018-01-01T00:00:00Z')
+        all_ohlcv = []
+        while True:
+            batch = exchange.fetch_ohlcv('BTC/USDT', '1d', since=since, limit=limit)
+            if not batch:
+                break
+            all_ohlcv.extend(batch)
+            since = batch[-1][0] + 86400000  # next day in ms
+            if len(batch) < 1000:
+                break
     except ccxt.NetworkError as exc:
         logger.error("Network error while fetching price data: %s", exc)
         if existing is not None:
@@ -79,10 +89,12 @@ def fetch_price_data(
         logger.error("Exchange error: %s", exc)
         raise
 
-    new_df = _ohlcv_to_dataframe(raw)
+    new_df = _ohlcv_to_dataframe(all_ohlcv)
 
     if existing is not None and not existing.empty:
-        combined = pd.concat([existing, new_df]).drop_duplicates().sort_index()
+        combined = pd.concat([existing, new_df])
+        combined = combined[combined.index.notna()]   # drop all-NA rows first
+        combined = combined.drop_duplicates().sort_index()
     else:
         combined = new_df
 

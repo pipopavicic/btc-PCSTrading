@@ -114,7 +114,7 @@ def _fetch_chart(
 
     # Convert hashrate from GH/s (blockchain.info unit) to EH/s
     if column_name == "hashrate":
-        df[column_name] = df[column_name] / 1e9  # GH/s → EH/s
+        df[column_name] = df[column_name] / 1e6  # GH/s → EH/s #change to 1e6 from 1e9 because blockchain.info changed their unit from GH/s to TH/s in late 2023
 
     df.to_csv(cache_path)
     logger.info("Saved %d rows to %s", len(df), cache_path)
