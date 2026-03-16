@@ -28,7 +28,11 @@ sys.path.insert(0, str(ROOT))
 
 from data.fetch_price import fetch_price_data          # noqa: E402
 from data.fetch_onchain import fetch_hashrate          # noqa: E402
-from models.production_cost import compute_production_cost  # noqa: E402
+# Engine 1 — Static (current)
+#from models.production_cost import compute_production_cost  # noqa: E402
+# Engine 2 — Dynamic (new)
+from models.production_cost_dynamic import compute_production_cost_dynamic as compute_production_cost  # noqa: E402
+
 from signals.signal_engine import compute_signals      # noqa: E402
 
 logger = logging.getLogger(__name__)
