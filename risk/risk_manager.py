@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_POSITION_FRACTION: float = 0.10   # 10% of portfolio per trade
+MAX_POSITION_FRACTION: float = 0.1   # 10% of portfolio per trade
 MIN_CASH_BUFFER: float = 0.25         # 25% USDC minimum
 ATR_PERIOD: int = 14
 ATR_MULTIPLIER: float = 2.0
@@ -158,6 +158,118 @@ def compute_position_size(
         btc_qty,
     )
     return float(btc_qty)
+
+def compute_kelly_position_size(
+    portfolio_value: float,
+    current_price: float,
+    win_rate: float,
+    avg_win_pct: float,
+    avg_loss_pct: float,
+    params: RiskParameters = RiskParameters(),
+) -> float:
+    """Half-Kelly position sizing based on historical win/loss statistics."""
+    if avg_loss_pct <= 0 or avg_win_pct <= 0:
+        return compute_position_size(portfolio_value, current_price, params)
+    
+    loss_rate = 1.0 - win_rate
+    kelly_f = (win_rate / avg_loss_pct) - (loss_rate / avg_win_pct)
+    kelly_f = max(0.0, kelly_f * 0.5)                    # half-Kelly
+    kelly_f = min(kelly_f, params.max_position_fraction)  # cap at limit
+    
+    allowed_usd = portfolio_value * kelly_f
+    btc_qty = allowed_usd / current_price if current_price > 0 else 0.0
+    logger.info("Kelly f*=%.3f → $%.0f → %.6f BTC", kelly_f, allowed_usd, btc_qty)
+    return float(btc_qty)
+
+
+# ---------------------------------------------------------------------------
+# Tranche / accumulation logic (Option B sophisticated sizing)
+# ---------------------------------------------------------------------------
+
+TRANCHE_SIZE: float = 0.10          # 10% NAV per tranche
+MAX_TRANCHES: int   = 3             # max 3 tranches = 30% max exposure
+
+@dataclass
+class TrancheState:
+    """Tracks open tranches for accumulation strategy."""
+    tranches: list = field(default_factory=list)
+    # Each tranche: {"entry_price": float, "pcr_at_entry": float, "size_usd": float}
+
+    @property
+    def total_tranches(self) -> int:
+        return len(self.tranches)
+
+    @property
+    def total_invested_usd(self) -> float:
+        return sum(t["size_usd"] for t in self.tranches)
+
+
+def get_tranche_action(
+    pcr: float,
+    state: TrancheState,
+    portfolio_value: float,
+    params: RiskParameters = RiskParameters(),
+) -> dict:
+    """
+    Decide whether to add a tranche, remove a tranche, or hold.
+
+    Entry thresholds (PCR-based):
+        Tranche 1: PCR < 0.90
+        Tranche 2: PCR < 0.80  (only if tranche 1 already open)
+        Tranche 3: PCR < 0.70  (only if tranches 1+2 already open)
+
+    Exit thresholds (FIFO — first tranche in, first out):
+        Tranche 1 exits: PCR > 1.40
+        Tranche 2 exits: PCR > 1.60
+        Tranche 3 exits: PCR > 1.80
+
+    Returns dict with keys:
+        "action"     : "BUY_TRANCHE" | "SELL_TRANCHE" | "HOLD"
+        "tranche_n"  : which tranche number (1, 2, or 3)
+        "size_usd"   : USD amount for this tranche
+        "reason"     : human-readable explanation
+    """
+    entry_thresholds = [0.90, 0.80, 0.70]   # PCR below = add tranche N
+    exit_thresholds  = [1.40, 1.60, 1.80]   # PCR above = close tranche N
+
+    n = state.total_tranches
+
+    # ── Check exits first (FIFO) ────────────────────────────────────────────
+    if n > 0 and pcr > exit_thresholds[0]:
+        # Close the oldest open tranche
+        tranche_to_close = state.tranches[0]
+        return {
+            "action":    "SELL_TRANCHE",
+            "tranche_n": 1,
+            "size_usd":  tranche_to_close["size_usd"],
+            "reason":    f"PCR {pcr:.2f} > exit threshold {exit_thresholds[n-1]:.2f}",
+        }
+
+    # ── Check entries ────────────────────────────────────────────────────────
+    if n < MAX_TRANCHES and pcr < entry_thresholds[n]:
+        # Can only add tranche N+1 if tranche N is already open
+        # (n==0 means no tranches yet → eligible for tranche 1 if PCR < 0.90)
+        size_usd = compute_kelly_position_size(
+        portfolio_value=portfolio_value,
+        current_price=1.0,          # dummy — we want USD not BTC qty here
+        win_rate=1.0,               # from your backtest: 100% win rate
+        avg_win_pct=5.0,            # avg winning trade return (update after backtest)
+        avg_loss_pct=1.0,           # avg losing trade return
+        params=params,
+        ) 
+        return {
+            "action":    "BUY_TRANCHE",
+            "tranche_n": n + 1,
+            "size_usd":  size_usd,
+            "reason":    f"PCR {pcr:.2f} < entry threshold {entry_thresholds[n]:.2f}",
+        }
+
+    return {
+        "action":    "HOLD",
+        "tranche_n": n,
+        "size_usd":  0.0,
+        "reason":    f"PCR {pcr:.2f} in neutral zone, {n} tranches open",
+    }
 
 
 def compute_var(
@@ -326,7 +438,7 @@ def _compute_atr(df: pd.DataFrame, period: int) -> Optional[float]:
 # CLI entry-point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+"""if __name__ == "__main__": #OLD - not in use anymore
     import sys
     from pathlib import Path
 
@@ -348,4 +460,44 @@ if __name__ == "__main__":
         btc_price=last_price,
         btc_position=btc_held,
     )
-    print(report)
+    print(report)"""
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    from data.fetch_price import fetch_price_data
+    from data.fetch_onchain import fetch_hashrate
+    from models.production_cost import compute_production_cost
+    from signals.signal_engine import compute_signals
+
+    price_df = fetch_price_data()
+    hr_df    = fetch_hashrate()
+    cost_df  = compute_production_cost(hr_df)
+    sig_df   = compute_signals(price_df, cost_df)
+
+    equity = (price_df["close"] / price_df["close"].iloc[0]) * 10_000
+    state  = TrancheState()
+
+    # Simulate last 10 days of tranche decisions
+    print("\n── Last 10 days of tranche decisions ──")
+    for date, row in sig_df.tail(10).iterrows():
+        action = get_tranche_action(row["pcr"], state, 10_000)
+        print(f"{date.date()}  PCR={row['pcr']:.3f}  → {action['action']:15s}  {action['reason']}")
+        if action["action"] == "BUY_TRANCHE":
+            state.tranches.append({"entry_price": row["close"],
+                                   "pcr_at_entry": row["pcr"],
+                                   "size_usd": action["size_usd"]})
+        elif action["action"] == "SELL_TRANCHE" and state.tranches:
+            state.tranches.pop(0)
+
+    # Full risk report on current state
+    report = evaluate_risk(
+        df_ohlcv=price_df,
+        equity_curve=equity,
+        btc_price=float(price_df["close"].iloc[-1]),
+        btc_position=state.total_invested_usd / float(price_df["close"].iloc[-1]),
+    )
+    print(f"\n{report}")
+

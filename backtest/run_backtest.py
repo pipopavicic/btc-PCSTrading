@@ -35,6 +35,17 @@ from models.production_cost_dynamic import compute_production_cost_dynamic as co
 
 from signals.signal_engine import compute_signals      # noqa: E402
 
+
+from risk.risk_manager import (                        # noqa: E402
+    RiskParameters,
+    TrancheState,
+    get_tranche_action,
+    evaluate_risk,
+    is_circuit_breaker_active,
+    compute_kelly_position_size,
+)
+
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -44,6 +55,8 @@ logger = logging.getLogger(__name__)
 INIT_CASH: float = 10_000.0
 FEES: float = 0.001     # 0.1% per side
 SLIPPAGE: float = 0.001  # 0.1% per trade
+
+MAX_TRANCHES: int = 3
 
 # ---------------------------------------------------------------------------
 # Output path
@@ -93,9 +106,48 @@ def run_backtest() -> dict:
     logger.info("Computing signals …")
     signals_df = compute_signals(price_df, cost_df)
 
-    close = signals_df["close"]
-    entries = signals_df["entry_signal"].fillna(False).astype(bool)
-    exits = signals_df["exit_signal"].fillna(False).astype(bool)
+    close   = signals_df["close"]
+    raw_entries = signals_df["entry_signal"].fillna(False).astype(bool)
+    raw_exits   = signals_df["exit_signal"].fillna(False).astype(bool)
+
+    # ------------------------------------------------------------------
+    # Risk Layer 1: Circuit Breaker — block entries during drawdown
+    # ------------------------------------------------------------------
+    risk_params  = RiskParameters()
+    equity_proxy = (close / close.iloc[0]) * INIT_CASH
+    monthly_peak = equity_proxy.rolling(window=21, min_periods=1).max()
+    monthly_dd   = (equity_proxy - monthly_peak) / monthly_peak
+    cb_mask      = monthly_dd < -risk_params.circuit_breaker_threshold
+
+    entries = raw_entries & ~cb_mask   # gate: no new entries when halted
+    exits   = raw_exits.copy()
+
+    cb_blocked = (raw_entries & cb_mask).sum()
+    if cb_blocked > 0:
+        logger.info("Circuit breaker blocked %d entry signals.", cb_blocked)
+
+    # ------------------------------------------------------------------
+    # Risk Layer 2: Tranche Entry Thresholds
+    # PCR must cross progressively deeper thresholds to add tranches
+    # Tranche 1: PCR < 0.90  (already in entries from signal_engine)
+    # Tranche 2: PCR < 0.80  (only if we've already had a T1 signal)
+    # Tranche 3: PCR < 0.70
+    # ------------------------------------------------------------------
+    pcr = signals_df["pcr"]
+
+    tranche_1 = raw_entries & (pcr < 0.90) & ~cb_mask
+    tranche_2 = raw_entries & (pcr < 0.80) & ~cb_mask
+    tranche_3 = raw_entries & (pcr < 0.70) & ~cb_mask
+
+    # Combine: fire entry if ANY tranche threshold is crossed
+    entries = (tranche_1 | tranche_2 | tranche_3)
+    exits   = raw_exits.copy()
+
+    logger.info(
+        "Tranche signals — T1: %d  T2: %d  T3: %d  Exits: %d",
+        tranche_1.sum(), tranche_2.sum(), tranche_3.sum(), exits.sum(),
+    )
+
 
     logger.info(
         "Signal summary: %d entries, %d exits over %d trading days.",
@@ -123,7 +175,11 @@ def run_backtest() -> dict:
         fees=FEES,
         slippage=SLIPPAGE,
         freq="1D",
+        accumulate=True,          # ← allows multiple buys without full exit
+        size=0.333,               # ← deploy 33% of available cash per tranche
+        size_type="percent",      # ← interpret size as fraction of available cash
     )
+
 
     # ------------------------------------------------------------------
     # 5. Metrics
@@ -164,6 +220,37 @@ def run_backtest() -> dict:
     # ------------------------------------------------------------------
     bh_return = (close.iloc[-1] / close.iloc[0] - 1)
     print(f"  Buy-and-Hold return over same period: {bh_return * 100:.1f}%\n")
+    # ------------------------------------------------------------------
+    # Risk Report — current state
+    # ------------------------------------------------------------------
+    try:
+        final_nav    = pd.Series(portfolio.value().values,
+                                index=portfolio.value().index)
+        last_price   = float(close.iloc[-1])
+                # Infer open position from portfolio final state
+        final_btc_value = float(portfolio.value().iloc[-1]) - float(portfolio.cash().iloc[-1])
+        btc_held        = max(final_btc_value, 0.0) / last_price
+        open_tranches   = int(entries.iloc[-30:].sum())  # proxy: entries in last 30 days
+
+
+        risk_report = evaluate_risk(
+            df_ohlcv=price_df,
+            equity_curve=final_nav,
+            btc_price=last_price,
+            btc_position=btc_held,
+            params=risk_params,
+        )
+
+        print("  Risk Report (end of backtest period):")
+        print(f"    Open tranches      : {open_tranches} / {MAX_TRANCHES}")
+        print(f"    ATR Stop Price     : ${risk_report.atr_stop:,.0f}" if risk_report.atr_stop else "    ATR Stop Price     : N/A")
+        print(f"    99% 1-day VaR      : ${risk_report.var_99:,.0f}")
+        print(f"    Drawdown from peak : {risk_report.drawdown_from_peak * 100:.1f}%")
+        print(f"    Circuit breaker    : {'ACTIVE ⛔' if risk_report.circuit_breaker_active else 'Inactive ✅'}")
+        print(f"    New entries allowed: {'Yes ✅' if risk_report.entries_allowed else 'No ⛔'}")
+        print("=" * 60 + "\n")
+    except Exception as exc:
+        logger.warning("Risk report failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Save equity curve
