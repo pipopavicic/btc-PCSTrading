@@ -3,7 +3,6 @@ Fetch Bitcoin on-chain metrics (hashrate, difficulty) from blockchain.info.
 
 Data is cached locally as CSV files inside data/raw/.
 """
-
 from __future__ import annotations
 
 import logging
@@ -15,37 +14,19 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-RAW_DIR = Path(__file__).parent / "raw"
-HASHRATE_CSV = RAW_DIR / "btc_hashrate.csv"
+RAW_DIR       = Path(__file__).parent / "raw"
+HASHRATE_CSV  = RAW_DIR / "btc_hashrate.csv"
 DIFFICULTY_CSV = RAW_DIR / "btc_difficulty.csv"
 
 BLOCKCHAIN_INFO_BASE = "https://api.blockchain.info/charts"
-REQUEST_TIMEOUT = 30  # seconds
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+REQUEST_TIMEOUT      = 30
 
 
 def fetch_hashrate(
     cache_path: Optional[Path] = None,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Fetch historical Bitcoin network hashrate from blockchain.info.
-
-    Args:
-        cache_path: Override the default CSV cache location.
-        force_refresh: If ``True``, ignore cache and re-download.
-
-    Returns:
-        DataFrame with columns [timestamp, hashrate] where hashrate is in
-        EH/s (exa-hashes per second).
-    """
+    """Fetch BTC network hashrate (EH/s) from blockchain.info with local CSV cache."""
     cache_path = cache_path or HASHRATE_CSV
     return _fetch_chart("hash-rate", cache_path, "hashrate", force_refresh)
 
@@ -54,48 +35,19 @@ def fetch_difficulty(
     cache_path: Optional[Path] = None,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Fetch historical Bitcoin mining difficulty from blockchain.info.
-
-    Args:
-        cache_path: Override the default CSV cache location.
-        force_refresh: If ``True``, ignore cache and re-download.
-
-    Returns:
-        DataFrame with columns [timestamp, difficulty].
-    """
+    """Fetch BTC mining difficulty from blockchain.info with local CSV cache."""
     cache_path = cache_path or DIFFICULTY_CSV
     return _fetch_chart("difficulty", cache_path, "difficulty", force_refresh)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _fetch_chart(
-    chart: str,
-    cache_path: Path,
-    column_name: str,
-    force_refresh: bool,
-) -> pd.DataFrame:
-    """Fetch a chart from blockchain.info and cache to CSV.
-
-    Args:
-        chart: Blockchain.info chart name (e.g. ``"hash-rate"``).
-        cache_path: Path to the local CSV cache.
-        column_name: Name to assign to the value column.
-        force_refresh: Skip cache and re-download if ``True``.
-
-    Returns:
-        DataFrame indexed by timestamp (UTC) with a single value column.
-    """
+def _fetch_chart(chart: str, cache_path: Path, column_name: str, force_refresh: bool) -> pd.DataFrame:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     if not force_refresh and cache_path.exists():
         logger.info("Loading %s from cache: %s", chart, cache_path)
         return _load_csv(cache_path)
 
-    url = f"{BLOCKCHAIN_INFO_BASE}/{chart}"
+    url    = f"{BLOCKCHAIN_INFO_BASE}/{chart}"
     params = {"format": "json", "timespan": "all"}
     logger.info("Fetching %s from %s", chart, url)
 
@@ -110,11 +62,11 @@ def _fetch_chart(
         raise
 
     data = response.json()
-    df = _parse_blockchain_info(data, column_name)
+    df   = _parse_blockchain_info(data, column_name)
 
-    # Convert hashrate from GH/s (blockchain.info unit) to EH/s
     if column_name == "hashrate":
-        df[column_name] = df[column_name] / 1e6  # GH/s → EH/s #change to 1e6 from 1e9 because blockchain.info changed their unit from GH/s to TH/s in late 2023
+        # blockchain.info units changed from GH/s to TH/s in late 2023
+        df[column_name] = df[column_name] / 1e6  # → EH/s
 
     df.to_csv(cache_path)
     logger.info("Saved %d rows to %s", len(df), cache_path)
@@ -122,41 +74,19 @@ def _fetch_chart(
 
 
 def _parse_blockchain_info(data: dict, column_name: str) -> pd.DataFrame:
-    """Parse a blockchain.info JSON response into a tidy DataFrame.
-
-    Args:
-        data: Parsed JSON response body.
-        column_name: Name to assign to the value column.
-
-    Returns:
-        DataFrame indexed by UTC datetime.
-    """
-    values = data.get("values", [])
+    values  = data.get("values", [])
     records = [{"timestamp": v["x"], column_name: v["y"]} for v in values]
     df = pd.DataFrame(records)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-    df = df.set_index("timestamp").sort_index()
-    return df
+    return df.set_index("timestamp").sort_index()
 
 
 def _load_csv(path: Path) -> pd.DataFrame:
-    """Load a cached on-chain metric CSV.
-
-    Args:
-        path: Path to the CSV file.
-
-    Returns:
-        DataFrame indexed by UTC-aware datetime.
-    """
     df = pd.read_csv(path, index_col="timestamp", parse_dates=True)
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     return df
 
-
-# ---------------------------------------------------------------------------
-# CLI entry-point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")

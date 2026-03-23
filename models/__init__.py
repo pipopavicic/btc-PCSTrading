@@ -1,1 +1,1 @@
-"""Production cost model for BTC mining cost estimation."""
+# models package
