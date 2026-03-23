@@ -4,6 +4,7 @@ A quantitative BTC/USDC allocation strategy grounded in the **Ornstein–Uhlenbe
 
 The core hypothesis: BTC price co-integrates with its marginal production cost. When the PCR diverges significantly from its rolling OU equilibrium, the strategy increases BTC exposure and earns USDC carry while under-allocated.
 
+PYTHON VERSION - Python 3.10.11
 ---
 
 ## Strategy overview
